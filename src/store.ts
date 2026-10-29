@@ -1600,7 +1600,6 @@ export type Store = {
   getCacheKey: typeof getCacheKey;
   getCachedResult: (cacheKey: string) => string | null;
   setCachedResult: (cacheKey: string, result: string) => void;
-  clearCache: () => void;
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
@@ -2633,7 +2632,6 @@ export function createStore(dbPath?: string): Store {
     getCacheKey,
     getCachedResult: (cacheKey: string) => getCachedResult(db, cacheKey),
     setCachedResult: (cacheKey: string, result: string) => setCachedResult(db, cacheKey, result),
-    clearCache: () => clearCache(db),
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
@@ -3131,10 +3129,6 @@ export function setCachedResult(db: Database, cacheKey: string, result: string):
   if (Math.random() < 0.01) {
     db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
   }
-}
-
-export function clearCache(db: Database): void {
-  db.exec(`DELETE FROM llm_cache`);
 }
 
 // =============================================================================

@@ -1376,8 +1376,7 @@ describe("Caching", () => {
     // Retrieve cache
     expect(store.getCachedResult(key)).toBe(value);
 
-    // Clear cache
-    store.clearCache();
+    expect(store.deleteLLMCache()).toBe(1);
     expect(store.getCachedResult(key)).toBeNull();
 
     await cleanupTestDb(store);
