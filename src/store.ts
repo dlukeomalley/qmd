@@ -3108,6 +3108,7 @@ export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL
 export type CacheKeyBody = {
   query?: string;
   model?: string;
+  contextTokens?: number;
   chunk?: string;
   file?: string;
 };
@@ -5323,6 +5324,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
   // reuse another model's cache entries (#764).
   const cacheModel = llm.rerankModelName ?? model;
+  const contextTokens = llm.rerankContextTokens;
+  const keyForChunk = (chunk: string) => getCacheKey("rerank:v2", {
+    query: rerankQuery, model: cacheModel, contextTokens, chunk,
+  });
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -5333,9 +5338,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    const cached = getCachedResult(db, keyForChunk(doc.text));
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
@@ -5352,8 +5355,9 @@ export async function rerank(query: string, documents: { file: string; text: str
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
+      if (rerankResult.model !== "fallback" && rerankResult.model === cacheModel) {
+        setCachedResult(db, keyForChunk(chunk), result.score.toString());
+      }
       cachedResults.set(chunk, result.score);
     }
   }
