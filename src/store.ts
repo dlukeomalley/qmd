@@ -2843,15 +2843,15 @@ export type HybridQueryExplain = {
   vectorScores: number[];
   rrf: {
     rank: number;          // Rank after RRF fusion (1-indexed)
-    positionScore: number; // 1 / rank used in position-aware blending
-    weight: number;        // Position-aware RRF weight (0.75 / 0.60 / 0.40)
+    positionScore: number; // Reciprocal fused rank, retained for diagnostics
+    weight: number;        // 0 for learned ordering; 1 without reranking
     baseScore: number;
     topRankBonus: number;
     totalScore: number;
     contributions: RRFContributionTrace[];
   };
   rerankScore: number;
-  blendedScore: number;
+  blendedScore: number;   // Final score: learned relevance or reciprocal fused rank
 };
 
 /**
@@ -6207,11 +6207,21 @@ export interface HybridQueryResult {
   body: string;             // full document body (for snippet extraction)
   bestChunk: string;        // best chunk text
   bestChunkPos: number;     // char offset of best chunk in body
-  score: number;            // blended score (full precision)
+  score: number;            // final ranking score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
   metadata: DocumentMetadata; // indexed qmd.metadata for the document
   explain?: HybridQueryExplain;
+}
+
+function compareReranked(
+  first: Pick<HybridQueryResult, "file" | "score">,
+  second: Pick<HybridQueryResult, "file" | "score">,
+  retrievalRanks: ReadonlyMap<string, number>,
+  fallbackRank: number,
+): number {
+  return second.score - first.score
+    || (retrievalRanks.get(first.file) ?? fallbackRank) - (retrievalRanks.get(second.file) ?? fallbackRank);
 }
 
 /**
@@ -6258,7 +6268,7 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 4. RRF fusion → slice to candidateLimit
  * 5. chunkDocument() + keyword-best-chunk selection
  * 6. rerank on chunks (NOT full bodies — O(tokens) trap)
- * 7. Position-aware score blending (RRF rank × reranker score)
+ * 7. Learned relevance ordering, with fused rank breaking equal-score ties
  * 8. Dedup by file, filter by minScore, slice to limit
  */
 export async function hybridQuery(
@@ -6495,21 +6505,14 @@ export async function hybridQuery(
   const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
-  // Step 7: Blend RRF position score with reranker score
-  // Position-aware weights: top retrieval results get more protection from reranker disagreement
+  // Step 7: Order by learned relevance; retrieval rank breaks exact score ties.
   const candidateMap = new Map(candidates.map(c => [c.file, {
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-  const blended = reranked.map(r => {
+  const ranked = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6522,15 +6525,15 @@ export async function hybridQuery(
       vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
+        positionScore: 1 / rrfRank,
+        weight: 0,
         baseScore: trace?.baseScore ?? 0,
         topRankBonus: trace?.topRankBonus ?? 0,
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
       rerankScore: r.score,
-      blendedScore,
+      blendedScore: r.score,
     } : undefined;
 
     return {
@@ -6540,16 +6543,16 @@ export async function hybridQuery(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: r.score,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => compareReranked(a, b, rrfRankMap, candidateLimit));
 
   // Step 8: Dedup by file (safety net — prevents duplicate output)
   const seenFiles = new Set<string>();
-  const finalResults = blended
+  const finalResults = ranked
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);
@@ -6672,7 +6675,7 @@ export interface StructuredSearchOptions {
  * 2. RRF fusion across all result lists
  * 3. Chunk documents + keyword-best-chunk selection
  * 4. Rerank on chunks
- * 5. Position-aware score blending
+ * 5. Learned relevance ordering, with fused rank breaking equal-score ties
  * 6. Dedup, filter, slice
  *
  * This is the recommended endpoint for capable LLMs — they can generate
@@ -6890,20 +6893,14 @@ export async function structuredSearch(
   const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
-  // Step 6: Blend RRF position score with reranker score
+  // Step 6: Order by learned relevance; retrieval rank breaks exact score ties.
   const candidateMap = new Map(candidates.map(c => [c.file, {
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-  const blended = reranked.map(r => {
+  const ranked = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6916,15 +6913,15 @@ export async function structuredSearch(
       vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
       rrf: {
         rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
+        positionScore: 1 / rrfRank,
+        weight: 0,
         baseScore: trace?.baseScore ?? 0,
         topRankBonus: trace?.topRankBonus ?? 0,
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
       rerankScore: r.score,
-      blendedScore,
+      blendedScore: r.score,
     } : undefined;
 
     return {
@@ -6934,16 +6931,16 @@ export async function structuredSearch(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score: r.score,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
     };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => compareReranked(a, b, rrfRankMap, candidateLimit));
 
   // Step 7: Dedup by file
   const seenFiles = new Set<string>();
-  const finalResults = blended
+  const finalResults = ranked
     .filter(r => {
       if (seenFiles.has(r.file)) return false;
       seenFiles.add(r.file);

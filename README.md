@@ -511,7 +511,7 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
                           │   RRF Fusion + Bonus  │
                           │  Original query: ×2   │
                           │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
+                          │   Candidate Pool      │
                           └───────────┬───────────┘
                                       │
                                       ▼
@@ -523,10 +523,8 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
                                       │
                                       ▼
                           ┌───────────────────────┐
-                          │  Position-Aware Blend │
-                          │  Top 1-3:  75% RRF    │
-                          │  Top 4-10: 60% RRF    │
-                          │  Top 11+:  40% RRF    │
+                          │  Learned Final Order  │
+                          │  RRF breaks score ties│
                           └───────────────────────┘
 ```
 
@@ -538,33 +536,29 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 |---------|-----------|------------|-------|
 | **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
 | **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| **Reranker** | Cross-encoder relevance | Native score | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
-The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware blending:
+The `query` command uses **Reciprocal Rank Fusion (RRF)** for candidate retrieval,
+then the native cross-encoder for final ordering:
 
-1. **Query Expansion**: Original query (×2 for weighting) + 1 LLM variation
-2. **Parallel Retrieval**: Each query searches both FTS and vector indexes
-3. **RRF Fusion**: Combine all result lists using `score = Σ(1/(k+rank+1))` where k=60
-4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
-5. **Top-K Selection**: Take top 30 candidates for reranking
-6. **Re-ranking**: LLM scores each document (yes/no with logprobs confidence)
-7. **Position-Aware Blending**:
-   - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
-   - RRF rank 4-10: 60% retrieval, 40% reranker
-   - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
+1. **Query expansion**: the original question and model-generated lexical, vector and HyDE queries.
+2. **Retrieval**: lexical queries use FTS; semantic queries use vectors.
+3. **RRF fusion**: combine retrieval lists, giving original-query lists extra weight.
+4. **Top-rank bonus**: preserve strong matches in the candidate pool.
+5. **Candidate selection**: bound the pool before model inference.
+6. **Reranking**: the model scores the selected passage from each candidate.
+7. **Final ordering**: descending learned relevance; equal scores use fused retrieval order.
 
-**Why this approach**: Pure RRF can dilute exact matches when expanded queries don't match. The top-rank bonus preserves documents that score #1 for the original query. Position-aware blending prevents the reranker from destroying high-confidence retrieval results.
+Retrieval decides what reaches the model; it does not reserve first place after
+reranking. With reranking disabled, results retain their fused retrieval order.
 
 ### Score Interpretation
 
-| Score | Meaning |
-|-------|---------|
-| 0.8 - 1.0 | Highly relevant |
-| 0.5 - 0.8 | Moderately relevant |
-| 0.2 - 0.5 | Somewhat relevant |
-| 0.0 - 0.2 | Low relevance |
+Treat scores as query-local ranking signals. Backends have different score
+semantics; an application must evaluate useful thresholds on its own corpus.
+The learned score is not a calibrated probability of answer correctness.
 
 ## Requirements
 
@@ -1257,7 +1251,7 @@ qmd search --md --full "error handling"
 # JSON output for scripting
 qmd query --json "quarterly reports"
 
-# Inspect how each result was scored (RRF + rerank blend)
+# Inspect candidate retrieval and learned relevance scores
 qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base
@@ -1278,7 +1272,7 @@ sub-query's contribution. Abbreviated:
     "vectorScores": [0.540, 0.484],
     "rrf": {
       "rank": 1,
-      "weight": 0.75,
+      "weight": 0,
       "baseScore": 0.123,
       "topRankBonus": 0.05,
       "totalScore": 0.173,
@@ -1534,17 +1528,15 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
          Top-rank bonus: +0.05/#1, +0.02/#2-3
                 │
                 ▼
-         Top 30 candidates
+         Bounded candidate pool
                 │
                 ▼
          LLM Re-ranking
          (yes/no + logprob confidence)
                 │
                 ▼
-         Position-Aware Blend
-         Rank 1-3:  75% RRF / 25% reranker
-         Rank 4-10: 60% RRF / 40% reranker
-         Rank 11+:  40% RRF / 60% reranker
+         Learned final ordering
+         (fused rank breaks exact score ties)
                 │
                 ▼
          Final Results

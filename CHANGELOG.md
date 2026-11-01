@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- After RRF candidate retrieval, full queries follow learned reranker scores;
+  fused rank breaks equal-score ties. The former position-weighted blend could
+  prevent any valid learned score from replacing the first retrieval result.
+  Non-reranked ordering is unchanged.
+
 ### Fixed
 
 - `qmd bench` propagates search errors instead of reporting failed queries as
