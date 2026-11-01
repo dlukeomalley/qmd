@@ -2,7 +2,7 @@
  * Benchmark admission, failed searches, and genuine zero-result runs.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,6 +95,7 @@ describe("runBenchmark", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -159,49 +160,30 @@ describe("runBenchmark", () => {
     const { dbPath, config } = await indexedCollection();
 
     const fixturePath = writeFixture("docs", "API versioning", "api.md");
-    const stderr: string[] = [];
-    const origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
-      return origWrite(chunk as string, ...(rest as []));
-    }) as typeof process.stderr.write;
-    try {
-      const result = await runBenchmark(fixturePath, {
-        json: true,
-        dbPath,
-        backends: ["bm25"],
-        config,
-      });
-      expect(result.summary.bm25?.avg_recall).toBeGreaterThan(0);
-      expect(stderr.join("")).not.toContain("All benchmark scores were 0.00");
-    } finally {
-      process.stderr.write = origWrite;
-    }
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const result = await runBenchmark(fixturePath, {
+      json: true,
+      dbPath,
+      backends: ["bm25"],
+      config,
+    });
+    expect(result.summary.bm25?.avg_recall).toBeGreaterThan(0);
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("All benchmark scores were 0.00"));
   });
 
   test("warns on stderr when every backend scores zero", async () => {
     const { dbPath, config } = await indexedCollection();
 
     const fixturePath = writeFixture("docs", "zzzz-no-such-token-in-corpus", "missing.md");
-    const stderr: string[] = [];
-    const origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
-      return origWrite(chunk as string, ...(rest as []));
-    }) as typeof process.stderr.write;
-    try {
-      const result = await runBenchmark(fixturePath, {
-        json: true,
-        dbPath,
-        backends: ["bm25"],
-        config,
-      });
-      expect(result.summary.bm25?.avg_recall).toBe(0);
-      expect(stderr.join("")).toContain("All benchmark scores were 0.00");
-      expect(stderr.join("")).toContain("qmd ls docs");
-    } finally {
-      process.stderr.write = origWrite;
-    }
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const result = await runBenchmark(fixturePath, {
+      json: true,
+      dbPath,
+      backends: ["bm25"],
+      config,
+    });
+    expect(result.summary.bm25?.avg_recall).toBe(0);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("qmd ls docs"));
   });
 
   test.each(["bm25", "vector", "hybrid", "full"])("rejects %s search failures instead of scoring them as misses", async (backend) => {
